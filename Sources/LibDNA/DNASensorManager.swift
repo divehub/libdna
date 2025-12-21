@@ -1,20 +1,6 @@
-import Combine
-import CoreBluetooth
+@preconcurrency import CoreBluetooth
 import Foundation
 import os
-
-/// Helper to allow passing AnyCancellable across concurrency domains safely.
-private final class SendableCancellable: @unchecked Sendable {
-    private let cancellable: AnyCancellable
-
-    init(_ cancellable: AnyCancellable) {
-        self.cancellable = cancellable
-    }
-
-    func cancel() {
-        cancellable.cancel()
-    }
-}
 
 /// Helper to pass non-Sendable values across isolation boundaries when we know it's safe (e.g. same thread).
 private struct UnsafeTransfer<T>: @unchecked Sendable {
@@ -22,26 +8,33 @@ private struct UnsafeTransfer<T>: @unchecked Sendable {
 }
 
 @MainActor
-public class DNASensorManager: NSObject, ObservableObject {
+@Observable
+public class DNASensorManager: NSObject {
     // MARK: - Published Properties
 
     /// The current connection state of the sensor.
-    @Published public private(set) var isConnected: Bool = false
+    public private(set) var isConnected: Bool = false
 
     /// The current scanning state.
-    @Published public private(set) var isScanning: Bool = false
+    public private(set) var isScanning: Bool = false
+
+    /// The connection in progress state.
+    public private(set) var isConnecting: Bool = false
 
     /// The latest reading received from the sensor.
-    @Published public private(set) var latestReading: DNASensorReading?
+    public private(set) var latestReading: DNASensorReading?
 
     /// The device information.
-    @Published public private(set) var deviceInfo: DNADeviceInfo = DNADeviceInfo()
+    public private(set) var deviceInfo: DNADeviceInfo = DNADeviceInfo()
 
     /// The battery level (0-100).
-    @Published public private(set) var batteryLevel: Int?
+    public private(set) var batteryLevel: Int?
 
     /// The list of discovered devices.
-    @Published public private(set) var discoveredDevices: [DNADiscoveredDevice] = []
+    public private(set) var discoveredDevices: [DNADiscoveredDevice] = []
+
+    /// The current Bluetooth state.
+    public private(set) var bluetoothState: CBManagerState = .unknown
 
     // MARK: - Async Streams
 
@@ -49,22 +42,31 @@ public class DNASensorManager: NSObject, ObservableObject {
     public var readings: AsyncStream<DNASensorReading> {
         let (stream, continuation) = AsyncStream<DNASensorReading>.makeStream()
 
-        let cancellable =
-            $latestReading
-            .compactMap { $0 }
-            .sink { reading in
-                continuation.yield(reading)
+        // Simple manual observation loop since we removed Combine
+        // Note: For a strictly correct AsyncStream from @Observable, we'd standardly use
+        // an AsyncSequence of the property. For now, we'll keep this simple or relying on consumers observing the property directly.
+        // However, to maintain API compatibility with existing AsyncStream consumers, we need to bridge it.
+        // Since @Observable doesn't easily emit values to a stream without a task watching it:
+        // We will add a private listener mechanism or update the continuation in the didUpdateValue logic.
+
+        // BETTER APPROACH: Add a private publisher or continuation handling just for this stream
+        // But since we are overhauling, let's keep it clean.
+        // Let's attach this continuation to a list of active listeners.
+
+        let id = UUID()
+        readingContinuations[id] = continuation
+
+        continuation.onTermination = { [weak self] _ in
+            Task { @MainActor in
+                self?.readingContinuations.removeValue(forKey: id)
             }
-
-        // Wrap cancellable in a Sendable box to satisfy strict concurrency checks.
-        let wrapper = SendableCancellable(cancellable)
-
-        continuation.onTermination = { _ in
-            wrapper.cancel()
         }
 
         return stream
     }
+
+    // Internal continuations for the async stream
+    private var readingContinuations: [UUID: AsyncStream<DNASensorReading>.Continuation] = [:]
 
     // MARK: - Internal Properties
     private var centralManager: CBCentralManager!
@@ -73,44 +75,55 @@ public class DNASensorManager: NSObject, ObservableObject {
     private var shouldScanWhenPoweredOn = false
     private let logger = Logger(subsystem: "ai.divehub.libdna", category: "BLE")
 
+    // Dedicated serial queue for Bluetooth operations to prevent Main Thread blocking
+    private let bleQueue = DispatchQueue(label: "ai.divehub.libdna.ble", qos: .userInitiated)
+
     // MARK: - Initialization
 
     public override init() {
         super.init()
-        // Using a serial queue can help with thread safety for CBCentralManager, but nil means Main Queue which is easier for @MainActor
-        self.centralManager = CBCentralManager(delegate: self, queue: nil)
+        // Initialize CBCentralManager on a background queue
+        self.centralManager = CBCentralManager(delegate: self, queue: bleQueue)
     }
 
     // MARK: - Public API
 
     /// Starts scanning for the DNA sensor.
     public func startScanning() {
-        if centralManager.state == .poweredOn {
+        let state = centralManager.state
+        if state == .poweredOn {
             startScanningInternal()
         } else {
-            logger.info(
-                "Bluetooth not ready yet (state: \(self.centralManager.state.rawValue)). Queuing scan..."
-            )
+            logger.info("Bluetooth not ready yet (state: \(state.rawValue)). Queuing scan...")
             shouldScanWhenPoweredOn = true
         }
     }
 
     private func startScanningInternal() {
-        logger.info("Starting scan for DNA Sensor service: \(DNAUUIDs.dnaAdvertisedService)")
+        logger.info("Starting scan for DNA Sensor service")
 
         // Reset discovery list
         discoveredDevices.removeAll()
         discoveredPeripherals.removeAll()
 
-        centralManager.scanForPeripherals(
-            withServices: [DNAUUIDs.dnaAdvertisedService], options: nil)
+        // Perform scan on the BLE queue
+        let cm = UnsafeTransfer(value: centralManager!)
+        bleQueue.async {
+            cm.value.scanForPeripherals(
+                withServices: [DNAUUIDs.dnaAdvertisedService, DNAUUIDs.dnaSensorService],
+                options: nil)
+        }
+
         isScanning = true
         shouldScanWhenPoweredOn = false
     }
 
     /// Stops scanning.
     public func stopScanning() {
-        centralManager.stopScan()
+        let cm = UnsafeTransfer(value: centralManager!)
+        bleQueue.async {
+            cm.value.stopScan()
+        }
         isScanning = false
         shouldScanWhenPoweredOn = false
     }
@@ -118,7 +131,11 @@ public class DNASensorManager: NSObject, ObservableObject {
     /// Disconnects from the current sensor.
     public func disconnect() {
         if let peripheral = peripheral {
-            centralManager.cancelPeripheralConnection(peripheral)
+            let p = UnsafeTransfer(value: peripheral)
+            let cm = UnsafeTransfer(value: centralManager!)
+            bleQueue.async {
+                cm.value.cancelPeripheralConnection(p.value)
+            }
         }
     }
 
@@ -135,9 +152,16 @@ public class DNASensorManager: NSObject, ObservableObject {
         // Stop scanning before connecting
         stopScanning()
 
+        isConnecting = true
         self.peripheral = peripheral
         self.peripheral?.delegate = self
-        self.centralManager.connect(peripheral, options: nil)
+
+        let p = UnsafeTransfer(value: peripheral)
+        let cm = UnsafeTransfer(value: centralManager!)
+
+        bleQueue.async {
+            cm.value.connect(p.value, options: nil)
+        }
     }
 }
 
@@ -146,11 +170,9 @@ extension DNASensorManager: CBCentralManagerDelegate {
     public nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         let state = central.state
         Task { @MainActor in
+            self.bluetoothState = state
             if state == .poweredOn {
                 self.logger.info("Bluetooth powered on.")
-                // We need to call startScanningInternal, but that requires access to 'self' which is isolated.
-                // We are in MainActor block, so self is available.
-                // We need to check shouldScanWhenPoweredOn which is on self.
                 if self.shouldScanWhenPoweredOn {
                     self.startScanningInternal()
                 }
@@ -166,23 +188,27 @@ extension DNASensorManager: CBCentralManagerDelegate {
         _ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
         advertisementData: [String: Any], rssi RSSI: NSNumber
     ) {
+        // Capture data to pass to MainActor
+        let identifier = peripheral.identifier
+
+        // Wrap peripheral in UnsafeTransfer to pass to MainActor
         let p = UnsafeTransfer(value: peripheral)
-        MainActor.assumeIsolated {
+        let name = peripheral.name ?? "Unknown"
+        let rssiValue = RSSI.intValue
+
+        Task { @MainActor in
             let peripheral = p.value
-            let name = peripheral.name ?? "Unknown"
-            let rssiValue = RSSI.intValue
 
-            self.logger.debug("Discovered peripheral: \(name)")
+            // Store peripheral (must keep reference)
+            self.discoveredPeripherals[identifier] = peripheral
 
-            // Store peripheral
-            self.discoveredPeripherals[peripheral.identifier] = peripheral
-
-            // Update published list if not already present or just update RSSI
-            let device = DNADiscoveredDevice(id: peripheral.identifier, name: name, rssi: rssiValue)
+            // Update visible list
+            let device = DNADiscoveredDevice(id: identifier, name: name, rssi: rssiValue)
 
             if let index = self.discoveredDevices.firstIndex(where: { $0.id == device.id }) {
                 self.discoveredDevices[index] = device
             } else {
+                self.logger.debug("Discovered peripheral: \(name)")
                 self.discoveredDevices.append(device)
             }
         }
@@ -192,17 +218,21 @@ extension DNASensorManager: CBCentralManagerDelegate {
         _ central: CBCentralManager, didConnect peripheral: CBPeripheral
     ) {
         let p = UnsafeTransfer(value: peripheral)
-        MainActor.assumeIsolated {
+        Task { @MainActor in
             let peripheral = p.value
             self.logger.info("Connected to \(peripheral.name ?? "Unknown")")
             self.isConnected = true
+            self.isConnecting = false
 
-            // Discover services
-            peripheral.discoverServices([
-                DNAUUIDs.dnaSensorService,
-                DNAUUIDs.deviceInformationService,
-                DNAUUIDs.batteryService,
-            ])
+            // Discover services on background queue
+            let p2 = UnsafeTransfer(value: peripheral)
+            self.bleQueue.async {
+                p2.value.discoverServices([
+                    DNAUUIDs.dnaSensorService,
+                    DNAUUIDs.deviceInformationService,
+                    DNAUUIDs.batteryService,
+                ])
+            }
         }
     }
 
@@ -210,8 +240,7 @@ extension DNASensorManager: CBCentralManagerDelegate {
         _ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?
     ) {
         let p = UnsafeTransfer(value: peripheral)
-        // let err = error // Unused
-        MainActor.assumeIsolated {
+        Task { @MainActor in
             self.logger.info("Disconnected from \(p.value.name ?? "Unknown")")
             self.isConnected = false
             self.peripheral = nil
@@ -222,9 +251,10 @@ extension DNASensorManager: CBCentralManagerDelegate {
         _ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?
     ) {
         let errDesc = error?.localizedDescription ?? "Unknown error"
-        MainActor.assumeIsolated {
+        Task { @MainActor in
             self.logger.error("Failed to connect: \(errDesc)")
             self.isConnected = false
+            self.isConnecting = false
             self.peripheral = nil
         }
     }
@@ -235,19 +265,16 @@ extension DNASensorManager: CBPeripheralDelegate {
     public nonisolated func peripheral(
         _ peripheral: CBPeripheral, didDiscoverServices error: Error?
     ) {
-        let p = UnsafeTransfer(value: peripheral)
-        MainActor.assumeIsolated {
-            let peripheral = p.value
-            guard let services = peripheral.services, error == nil else { return }
+        guard let services = peripheral.services, error == nil else { return }
 
-            for service in services {
-                if service.uuid == DNAUUIDs.dnaSensorService {
-                    peripheral.discoverCharacteristics(nil, for: service)
-                } else if service.uuid == DNAUUIDs.deviceInformationService {
-                    peripheral.discoverCharacteristics(nil, for: service)
-                } else if service.uuid == DNAUUIDs.batteryService {
-                    peripheral.discoverCharacteristics([DNAUUIDs.batteryLevel], for: service)
-                }
+        // Process services
+        for service in services {
+            if service.uuid == DNAUUIDs.dnaSensorService {
+                peripheral.discoverCharacteristics(nil, for: service)
+            } else if service.uuid == DNAUUIDs.deviceInformationService {
+                peripheral.discoverCharacteristics(nil, for: service)
+            } else if service.uuid == DNAUUIDs.batteryService {
+                peripheral.discoverCharacteristics([DNAUUIDs.batteryLevel], for: service)
             }
         }
     }
@@ -304,15 +331,21 @@ extension DNASensorManager: CBPeripheralDelegate {
         _ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
         error: Error?
     ) {
-        let c = UnsafeTransfer(value: characteristic)
-        MainActor.assumeIsolated {
-            let characteristic = c.value
-            guard let data = characteristic.value, error == nil else { return }
+        guard let data = characteristic.value, error == nil else { return }
 
-            // Helper to string
-            let stringValue = String(data: data, encoding: .utf8)
+        let uuid = characteristic.uuid
+        let stringValue = String(data: data, encoding: .utf8)
 
-            switch characteristic.uuid {
+        // Needed for service check inside Task
+        let isDNAService = characteristic.service?.uuid == DNAUUIDs.dnaSensorService
+
+        // Use UnsafeTransfer for UUID to switch on it, or just use unsafe transfer for the char if needed.
+        // Or simpler: Just dispatch. CBUUID is technically not Sendable but immutable.
+        // Let's use UnsafeTransfer for the UUID to satisfy compiler.
+        let u = UnsafeTransfer(value: uuid)
+
+        Task { @MainActor in
+            switch u.value {
             case DNAUUIDs.manufacturerNameString:
                 self.deviceInfo.manufacturerName = stringValue
 
@@ -335,9 +368,13 @@ extension DNASensorManager: CBPeripheralDelegate {
 
             default:
                 // Check if it belongs to our custom service
-                if characteristic.service?.uuid == DNAUUIDs.dnaSensorService {
+                if isDNAService {
                     if let reading = DNASensorReading(data: data) {
                         self.latestReading = reading
+                        // Notify streams
+                        for continuation in self.readingContinuations.values {
+                            continuation.yield(reading)
+                        }
                     }
                 }
             }
