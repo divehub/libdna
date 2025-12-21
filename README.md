@@ -99,3 +99,9 @@ swift run DNAClient
 ## License
 
 [MIT License](LICENSE)
+
+## Disclaimer
+
+**DNA** and **DIVESOFT** are trademarks of **DIVESOFT**. This library is an independent project and is not affiliated with, endorsed by, or associated with DIVESOFT in any way.
+
+This software is provided for educational and experimental purposes only. **Use it at your own risk.** The authors assume no liability for any equipment damage, personal injury, or other issues arising from the use of this library.
