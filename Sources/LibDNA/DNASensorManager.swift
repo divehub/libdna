@@ -178,8 +178,9 @@ extension DNASensorManager: CBCentralManagerDelegate {
                 }
             } else {
                 self.logger.info("Bluetooth state changed: \(state.rawValue)")
+                // Only stop scanning if Bluetooth is not powered on
+                // Don't disconnect - let the peripheral delegate handle actual disconnections
                 self.isScanning = false
-                self.isConnected = false
             }
         }
     }
