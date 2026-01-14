@@ -50,6 +50,28 @@ public class SimulatedDNASensorManager: NSObject {
 
     // Internal continuations for the async stream
     private var readingContinuations: [UUID: AsyncStream<DNASensorReading>.Continuation] = [:]
+    private var bluetoothStateContinuations: [UUID: AsyncStream<CBManagerState>.Continuation] = [:]
+    private var scanContinuation: AsyncThrowingStream<DNADiscoveredDevice, Error>.Continuation?
+    private var scanTimeoutTask: Task<Void, Never>?
+    private var scanTask: Task<Void, Never>?
+    private var activeScanID: UUID?
+
+    /// Async stream of Bluetooth state updates.
+    public var bluetoothStateUpdates: AsyncStream<CBManagerState> {
+        let (stream, continuation) = AsyncStream<CBManagerState>.makeStream()
+
+        let id = UUID()
+        bluetoothStateContinuations[id] = continuation
+        continuation.yield(bluetoothState)
+
+        continuation.onTermination = { [weak self] _ in
+            Task { @MainActor in
+                self?.bluetoothStateContinuations.removeValue(forKey: id)
+            }
+        }
+
+        return stream
+    }
 
     // MARK: - Simulation Properties
 
@@ -65,30 +87,57 @@ public class SimulatedDNASensorManager: NSObject {
 
     // MARK: - Public API
 
-    /// Starts scanning for the DNA sensor (simulated).
-    public func startScanning() {
-        guard !isScanning else { return }
+    /// Scans for DNA sensors and yields discoveries as they arrive.
+    public func scan(timeout: Duration = .seconds(10))
+        -> AsyncThrowingStream<DNADiscoveredDevice, Error>
+    {
+        AsyncThrowingStream { continuation in
+            stopScan()
 
-        isScanning = true
-        discoveredDevices.removeAll()
+            let scanID = UUID()
+            activeScanID = scanID
+            scanContinuation = continuation
 
-        // Simulate discovery delay
-        Task {
-            try? await Task.sleep(for: .milliseconds(500))
-            guard isScanning else { return }
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, self.activeScanID == scanID else { return }
+                    self.stopScan()
+                }
+            }
 
-            let mockDevice = DNADiscoveredDevice(
-                id: simulatedDeviceID,
-                name: "Simulated DNA Sensor",
-                rssi: -50
-            )
-            discoveredDevices = [mockDevice]
+            for device in discoveredDevices {
+                continuation.yield(device)
+            }
+
+            guard activeScanID == scanID else { return }
+
+            startScanningInternal(scanID: scanID)
+
+            if timeout != .zero {
+                scanTimeoutTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: timeout)
+                    guard let self, self.activeScanID == scanID else { return }
+                    self.stopScan()
+                }
+            }
         }
     }
 
+    /// Starts scanning for the DNA sensor (simulated).
+    @available(*, deprecated, message: "Use scan(timeout:)")
+    public func startScanning() {
+        stopScan()
+        let scanID = UUID()
+        activeScanID = scanID
+        startScanningInternal(scanID: scanID)
+    }
+
     /// Stops scanning.
-    public func stopScanning() {
+    public func stopScan() {
+        scanTask?.cancel()
+        scanTask = nil
         isScanning = false
+        finishScan()
     }
 
     /// Disconnects from the current sensor.
@@ -106,7 +155,7 @@ public class SimulatedDNASensorManager: NSObject {
             return
         }
 
-        stopScanning()
+        stopScan()
         isConnecting = true
 
         Task {
@@ -131,6 +180,43 @@ public class SimulatedDNASensorManager: NSObject {
     }
 
     // MARK: - Simulation
+
+    private func startScanningInternal(scanID: UUID) {
+        guard !isScanning else { return }
+
+        isScanning = true
+        discoveredDevices.removeAll()
+
+        scanTask?.cancel()
+        scanTask = Task { @MainActor [weak self] in
+            guard let self, self.activeScanID == scanID else { return }
+            try? await Task.sleep(for: .milliseconds(500))
+            guard self.activeScanID == scanID, self.isScanning else { return }
+
+            let mockDevice = DNADiscoveredDevice(
+                id: simulatedDeviceID,
+                name: "Simulated DNA Sensor",
+                rssi: -50
+            )
+            self.discoveredDevices = [mockDevice]
+            self.scanContinuation?.yield(mockDevice)
+        }
+    }
+
+    private func finishScan(throwing error: Error? = nil) {
+        scanTimeoutTask?.cancel()
+        scanTimeoutTask = nil
+        activeScanID = nil
+
+        guard let continuation = scanContinuation else { return }
+        scanContinuation = nil
+
+        if let error {
+            continuation.finish(throwing: error)
+        } else {
+            continuation.finish()
+        }
+    }
 
     private func startSimulation() {
         simulationStartTime = Date()
@@ -166,3 +252,5 @@ public class SimulatedDNASensorManager: NSObject {
         )
     }
 }
+
+extension SimulatedDNASensorManager: BluetoothScanningManaging {}

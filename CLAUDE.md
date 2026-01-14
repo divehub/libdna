@@ -42,7 +42,7 @@ The sensor sends 8 bytes of data:
 
 ## Common Pitfalls
 
-- **"Bluetooth is not powered on"**: `startScanning()` checks for `.poweredOn`. If not ready, it sets a flag `shouldScanWhenPoweredOn`. The delegate `centralManagerDidUpdateState` picks this up.
+- **"Bluetooth is not powered on"**: `scan(timeout:)` (and deprecated `startScanning()`) checks for `.poweredOn`. If not ready, it sets a flag `shouldScanWhenPoweredOn`. The delegate `centralManagerDidUpdateState` picks this up.
 - **"N/A" Device Info**: `DNAClient` uses a debounce logic because device info characteristics arrive asynchronously and potentially out of order.
 - **Permissions**: Code running on macOS needs `Privacy - Bluetooth Always Usage Description` in `Info.plist` (app) or terminal permissions (CLI).
 

@@ -16,18 +16,16 @@ struct DNAClient {
         let calibration = CalibrationState()
 
         print("Starting scan for 15 seconds...")
-        dnaManager.startScanning()
-
-        // Wait for device discovery
         var device: DNADiscoveredDevice?
-        let scanDeadline = Date().addingTimeInterval(15)
-
-        while device == nil && Date() < scanDeadline {
-            try? await Task.sleep(for: .milliseconds(100))
-            if let found = dnaManager.discoveredDevices.first {
-                device = found
+        do {
+            for try await discovery in dnaManager.scan(timeout: .seconds(15)) {
+                device = discovery
+                break
             }
+        } catch {
+            print("\nScan failed: \(error)")
         }
+        dnaManager.stopScan()
 
         guard let foundDevice = device else {
             print("\nTimeout reached. No device found.")

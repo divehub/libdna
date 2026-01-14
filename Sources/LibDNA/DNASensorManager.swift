@@ -7,6 +7,11 @@ private struct UnsafeTransfer<T>: @unchecked Sendable {
     let value: T
 }
 
+public enum DNAScanError: Error {
+    case unauthorized
+    case unsupported
+}
+
 @MainActor
 @Observable
 public class DNASensorManager: NSObject {
@@ -65,8 +70,29 @@ public class DNASensorManager: NSObject {
         return stream
     }
 
+    /// Async stream of Bluetooth state updates.
+    public var bluetoothStateUpdates: AsyncStream<CBManagerState> {
+        let (stream, continuation) = AsyncStream<CBManagerState>.makeStream()
+
+        let id = UUID()
+        bluetoothStateContinuations[id] = continuation
+        continuation.yield(bluetoothState)
+
+        continuation.onTermination = { [weak self] _ in
+            Task { @MainActor in
+                self?.bluetoothStateContinuations.removeValue(forKey: id)
+            }
+        }
+
+        return stream
+    }
+
     // Internal continuations for the async stream
     private var readingContinuations: [UUID: AsyncStream<DNASensorReading>.Continuation] = [:]
+    private var bluetoothStateContinuations: [UUID: AsyncStream<CBManagerState>.Continuation] = [:]
+    private var scanContinuation: AsyncThrowingStream<DNADiscoveredDevice, Error>.Continuation?
+    private var scanTimeoutTask: Task<Void, Never>?
+    private var activeScanID: UUID?
 
     // MARK: - Internal Properties
     private var centralManager: CBCentralManager!
@@ -88,8 +114,61 @@ public class DNASensorManager: NSObject {
 
     // MARK: - Public API
 
+    /// Scans for DNA sensors and yields discoveries as they arrive.
+    public func scan(timeout: Duration = .seconds(10))
+        -> AsyncThrowingStream<DNADiscoveredDevice, Error>
+    {
+        AsyncThrowingStream { continuation in
+            stopScan()
+
+            let scanID = UUID()
+            activeScanID = scanID
+            scanContinuation = continuation
+
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in
+                    guard let self, self.activeScanID == scanID else { return }
+                    self.stopScan()
+                }
+            }
+
+            for device in discoveredDevices {
+                continuation.yield(device)
+            }
+
+            guard activeScanID == scanID else { return }
+
+            let state = centralManager.state
+            switch state {
+            case .poweredOn:
+                startScanningInternal()
+            case .unauthorized:
+                finishScan(throwing: DNAScanError.unauthorized)
+                return
+            case .unsupported:
+                finishScan(throwing: DNAScanError.unsupported)
+                return
+            default:
+                logger.info(
+                    "Bluetooth not ready yet (state: \(state.rawValue)). Queuing scan...")
+                shouldScanWhenPoweredOn = true
+            }
+
+            if timeout != .zero {
+                scanTimeoutTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: timeout)
+                    guard let self, self.activeScanID == scanID else { return }
+                    self.stopScan()
+                }
+            }
+        }
+    }
+
     /// Starts scanning for the DNA sensor.
+    @available(*, deprecated, message: "Use scan(timeout:)")
     public func startScanning() {
+        stopScan()
+
         let state = centralManager.state
         if state == .poweredOn {
             startScanningInternal()
@@ -119,13 +198,29 @@ public class DNASensorManager: NSObject {
     }
 
     /// Stops scanning.
-    public func stopScanning() {
+    public func stopScan() {
         let cm = UnsafeTransfer(value: centralManager!)
         bleQueue.async {
             cm.value.stopScan()
         }
         isScanning = false
+        finishScan()
+    }
+
+    private func finishScan(throwing error: Error? = nil) {
+        scanTimeoutTask?.cancel()
+        scanTimeoutTask = nil
         shouldScanWhenPoweredOn = false
+        activeScanID = nil
+
+        guard let continuation = scanContinuation else { return }
+        scanContinuation = nil
+
+        if let error {
+            continuation.finish(throwing: error)
+        } else {
+            continuation.finish()
+        }
     }
 
     /// Disconnects from the current sensor.
@@ -150,7 +245,7 @@ public class DNASensorManager: NSObject {
         logger.info("Connecting to \(peripheral.name ?? "Unknown") (\(peripheral.identifier))")
 
         // Stop scanning before connecting
-        stopScanning()
+        stopScan()
 
         isConnecting = true
         self.peripheral = peripheral
@@ -165,18 +260,33 @@ public class DNASensorManager: NSObject {
     }
 }
 
+extension DNASensorManager: BluetoothScanningManaging {}
+
 // MARK: - CBCentralManagerDelegate
 extension DNASensorManager: CBCentralManagerDelegate {
     public nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         let state = central.state
         Task { @MainActor in
             self.bluetoothState = state
-            if state == .poweredOn {
+            for continuation in self.bluetoothStateContinuations.values {
+                continuation.yield(state)
+            }
+
+            switch state {
+            case .poweredOn:
                 self.logger.info("Bluetooth powered on.")
                 if self.shouldScanWhenPoweredOn {
                     self.startScanningInternal()
                 }
-            } else {
+            case .unauthorized:
+                self.logger.info("Bluetooth unauthorized.")
+                self.isScanning = false
+                self.finishScan(throwing: DNAScanError.unauthorized)
+            case .unsupported:
+                self.logger.info("Bluetooth unsupported.")
+                self.isScanning = false
+                self.finishScan(throwing: DNAScanError.unsupported)
+            default:
                 self.logger.info("Bluetooth state changed: \(state.rawValue)")
                 // Only stop scanning if Bluetooth is not powered on
                 // Don't disconnect - let the peripheral delegate handle actual disconnections
@@ -212,6 +322,8 @@ extension DNASensorManager: CBCentralManagerDelegate {
                 self.logger.debug("Discovered peripheral: \(name)")
                 self.discoveredDevices.append(device)
             }
+
+            self.scanContinuation?.yield(device)
         }
     }
 

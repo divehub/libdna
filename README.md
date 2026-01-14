@@ -7,7 +7,7 @@
 - **Manual Connection Control**: Scan, discover, and choose which device to connect to.
 - **Real-time Oxygen Readings**: Stream raw voltage, filtered voltage, and ambient pressure.
 - **Async/Await Support**: Modern Swift concurrency support with `AsyncStream`.
-- **Combine Support**: Reactive publishers for device state and data.
+- **Observation Support**: `@Observable` state for SwiftUI-friendly updates.
 - **Device Metadata**: Reads manufacturer, model, serial number, firmware version, and battery level.
 - **Strict Concurrency**: Fully compliant with Swift 6 strict concurrency checks (`Sendable`, `@MainActor`).
 - **Included CLI**: A command-line tool `DNAClient` for testing and demonstration.
@@ -36,29 +36,29 @@ dependencies: [
 
 ```swift
 import LibDNA
-import Combine
 
 @MainActor
 class OxygenMonitor {
-    private let scanner = DNASensorManager()
-    private var cancellables = Set<AnyCancellable>()
-    
+    private let manager = DNASensorManager()
+    private var scanTask: Task<Void, Never>?
+
     func start() {
-        // 1. Start scanning
-        scanner.startScanning()
-        
-        // 2. Observe discovered devices and connect
-        scanner.$discoveredDevices
-            .compactMap { $0.first } // For this example, just pick the first one
-            .sink { [weak self] device in
-                print("Found \(device.name), connecting...")
-                self?.scanner.connect(to: device.id)
+        // 1. Start scanning and connect to the first device found
+        scanTask = Task {
+            do {
+                for try await device in manager.scan(timeout: .seconds(10)) {
+                    print("Found \(device.name), connecting...")
+                    manager.connect(to: device.id)
+                    break
+                }
+            } catch {
+                print("Scan failed: \(error)")
             }
-            .store(in: &cancellables)
-        
-        // 3. Listen for readings using AsyncStream
+        }
+
+        // 2. Listen for readings using AsyncStream
         Task {
-            for await reading in scanner.readings {
+            for await reading in manager.readings {
                 print("O2: \(reading.filteredVoltage) mV, Pressure: \(reading.ambientPressure) hPa")
             }
         }
