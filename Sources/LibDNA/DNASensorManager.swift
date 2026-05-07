@@ -132,10 +132,6 @@ public class DNASensorManager: NSObject {
                 }
             }
 
-            for device in discoveredDevices {
-                continuation.yield(device)
-            }
-
             guard activeScanID == scanID else { return }
 
             let state = centralManager.state
@@ -190,7 +186,7 @@ public class DNASensorManager: NSObject {
         bleQueue.async {
             cm.value.scanForPeripherals(
                 withServices: [DNAUUIDs.dnaAdvertisedService, DNAUUIDs.dnaSensorService],
-                options: nil)
+                options: DNAScanPolicy.coreBluetoothScanOptions)
         }
 
         isScanning = true
@@ -232,6 +228,9 @@ public class DNASensorManager: NSObject {
                 cm.value.cancelPeripheralConnection(p.value)
             }
         }
+        isConnecting = false
+        isConnected = false
+        latestReading = nil
     }
 
     /// Connects to a specific discovered device.
@@ -313,14 +312,16 @@ extension DNASensorManager: CBCentralManagerDelegate {
             // Store peripheral (must keep reference)
             self.discoveredPeripherals[identifier] = peripheral
 
-            // Update visible list
-            let device = DNADiscoveredDevice(id: identifier, name: name, rssi: rssiValue)
+            let isNewDevice = !self.discoveredDevices.contains { $0.id == identifier }
+            let device = DNAScanPolicy.recordDiscovery(
+                id: identifier,
+                name: name,
+                rssi: rssiValue,
+                in: &self.discoveredDevices
+            )
 
-            if let index = self.discoveredDevices.firstIndex(where: { $0.id == device.id }) {
-                self.discoveredDevices[index] = device
-            } else {
+            if isNewDevice {
                 self.logger.debug("Discovered peripheral: \(name)")
-                self.discoveredDevices.append(device)
             }
 
             self.scanContinuation?.yield(device)

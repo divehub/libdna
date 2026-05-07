@@ -77,11 +77,29 @@ public class SimulatedDNASensorManager: NSObject {
 
     private var simulationStartTime: Date?
     private var simulationTask: Task<Void, Never>?
+    private var connectionTask: Task<Void, Never>?
     private let simulatedDeviceID = UUID()
+    private let scanInitialDelay: Duration
+    private let scanUpdateInterval: Duration
+    private let scanRSSIValues: [Int]
 
     // MARK: - Initialization
 
     public override init() {
+        self.scanInitialDelay = .milliseconds(500)
+        self.scanUpdateInterval = .milliseconds(750)
+        self.scanRSSIValues = [-50, -65, -75, -85]
+        super.init()
+    }
+
+    init(
+        scanInitialDelay: Duration = .milliseconds(500),
+        scanUpdateInterval: Duration = .milliseconds(750),
+        scanRSSIValues: [Int] = [-50, -65, -75, -85]
+    ) {
+        self.scanInitialDelay = scanInitialDelay
+        self.scanUpdateInterval = scanUpdateInterval
+        self.scanRSSIValues = scanRSSIValues.isEmpty ? [-50] : scanRSSIValues
         super.init()
     }
 
@@ -103,10 +121,6 @@ public class SimulatedDNASensorManager: NSObject {
                     guard let self, self.activeScanID == scanID else { return }
                     self.stopScan()
                 }
-            }
-
-            for device in discoveredDevices {
-                continuation.yield(device)
             }
 
             guard activeScanID == scanID else { return }
@@ -142,8 +156,11 @@ public class SimulatedDNASensorManager: NSObject {
 
     /// Disconnects from the current sensor.
     public func disconnect() {
+        connectionTask?.cancel()
+        connectionTask = nil
         simulationTask?.cancel()
         simulationTask = nil
+        isConnecting = false
         isConnected = false
         latestReading = nil
     }
@@ -156,26 +173,35 @@ public class SimulatedDNASensorManager: NSObject {
         }
 
         stopScan()
+        connectionTask?.cancel()
+        connectionTask = nil
         isConnecting = true
 
-        Task {
+        connectionTask = Task { @MainActor [weak self] in
             // Simulate connection delay
-            try? await Task.sleep(for: .milliseconds(300))
+            do {
+                try await Task.sleep(for: .milliseconds(300))
+            } catch {
+                return
+            }
 
-            isConnecting = false
-            isConnected = true
+            guard let self, !Task.isCancelled else { return }
+
+            self.connectionTask = nil
+            self.isConnecting = false
+            self.isConnected = true
 
             // Set mock device info
-            deviceInfo = DNADeviceInfo(
+            self.deviceInfo = DNADeviceInfo(
                 manufacturerName: "DiveHub",
                 modelNumber: "DNA Simulator",
                 serialNumber: "SIM-DNA-001",
                 hardwareRevision: "1.0",
                 firmwareRevision: "1.0-SIM"
             )
-            batteryLevel = 50
+            self.batteryLevel = 50
 
-            startSimulation()
+            self.startSimulation()
         }
     }
 
@@ -190,16 +216,28 @@ public class SimulatedDNASensorManager: NSObject {
         scanTask?.cancel()
         scanTask = Task { @MainActor [weak self] in
             guard let self, self.activeScanID == scanID else { return }
-            try? await Task.sleep(for: .milliseconds(500))
-            guard self.activeScanID == scanID, self.isScanning else { return }
+            var rssiIndex = 0
 
-            let mockDevice = DNADiscoveredDevice(
-                id: simulatedDeviceID,
-                name: "Simulated DNA Sensor",
-                rssi: -50
-            )
-            self.discoveredDevices = [mockDevice]
-            self.scanContinuation?.yield(mockDevice)
+            while !Task.isCancelled {
+                let delay = rssiIndex == 0 ? self.scanInitialDelay : self.scanUpdateInterval
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    return
+                }
+
+                guard self.activeScanID == scanID, self.isScanning else { return }
+
+                let rssi = self.scanRSSIValues[rssiIndex % self.scanRSSIValues.count]
+                let mockDevice = DNAScanPolicy.recordDiscovery(
+                    id: self.simulatedDeviceID,
+                    name: "Simulated DNA Sensor",
+                    rssi: rssi,
+                    in: &self.discoveredDevices
+                )
+                self.scanContinuation?.yield(mockDevice)
+                rssiIndex += 1
+            }
         }
     }
 
