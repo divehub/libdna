@@ -71,7 +71,8 @@ final class LibDNATests: XCTestCase {
         let manager = SimulatedDNASensorManager(
             scanInitialDelay: .zero,
             scanUpdateInterval: .milliseconds(1),
-            scanRSSIValues: [-50, -58, -46]
+            scanRSSIValues: [-50, -58, -46],
+            includeFlakyDevice: false
         )
 
         var discoveries: [DNADiscoveredDevice] = []
@@ -116,7 +117,8 @@ final class LibDNATests: XCTestCase {
     func testDisconnectCancelsPendingSimulatedConnect() async throws {
         let manager = SimulatedDNASensorManager(
             scanInitialDelay: .zero,
-            scanUpdateInterval: .milliseconds(1)
+            scanUpdateInterval: .milliseconds(1),
+            includeFlakyDevice: false
         )
 
         guard let device = await firstDiscovery(
@@ -142,7 +144,8 @@ final class LibDNATests: XCTestCase {
     func testDefaultSimulatedScanRSSISpansSignalStrengthBuckets() async throws {
         let manager = SimulatedDNASensorManager(
             scanInitialDelay: .zero,
-            scanUpdateInterval: .milliseconds(1)
+            scanUpdateInterval: .milliseconds(1),
+            includeFlakyDevice: false
         )
 
         var discoveries: [DNADiscoveredDevice] = []
@@ -157,16 +160,71 @@ final class LibDNATests: XCTestCase {
         XCTAssertEqual(discoveries.map(\.rssi), [-50, -65, -75, -85])
     }
 
+    @MainActor
+    func testDefaultSimulatedScanIncludesFlakyDevice() async throws {
+        let manager = SimulatedDNASensorManager(
+            scanInitialDelay: .zero,
+            scanUpdateInterval: .milliseconds(1)
+        )
+
+        var discoveries: [DNADiscoveredDevice] = []
+        for try await discovery in manager.scan(timeout: .seconds(1)) {
+            discoveries.append(discovery)
+            if discoveries.contains(where: { $0.name == "Flaky Simulated DNA Sensor" }) {
+                manager.stopScan()
+                break
+            }
+        }
+
+        XCTAssertTrue(discoveries.contains(where: { $0.name == "Simulated DNA Sensor" }))
+        XCTAssertTrue(discoveries.contains(where: { $0.name == "Flaky Simulated DNA Sensor" }))
+    }
+
+    @MainActor
+    func testFlakySimulatedDeviceDisconnectsAfterConfiguredInterval() async throws {
+        let manager = SimulatedDNASensorManager(
+            scanInitialDelay: .zero,
+            scanUpdateInterval: .milliseconds(1),
+            flakyDisconnectInterval: .milliseconds(20)
+        )
+
+        let flakyDevice = await firstDiscovery(
+            in: manager.scan(timeout: .seconds(1)),
+            within: .seconds(1),
+            where: { $0.name == "Flaky Simulated DNA Sensor" }
+        )
+        guard let flakyDevice else {
+            XCTFail("Expected flaky simulated discovery")
+            return
+        }
+
+        manager.connect(to: flakyDevice.id)
+        let didConnect = await waitUntil { manager.isConnected }
+        XCTAssertTrue(didConnect)
+
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertFalse(manager.isConnected)
+        XCTAssertFalse(manager.isConnecting)
+        XCTAssertNil(manager.latestReading)
+    }
+
 }
 
 private func firstDiscovery(
     in stream: AsyncThrowingStream<DNADiscoveredDevice, Error>,
-    within timeout: Duration
+    within timeout: Duration,
+    where predicate: @escaping @Sendable (DNADiscoveredDevice) -> Bool = { _ in true }
 ) async -> DNADiscoveredDevice? {
     await withTaskGroup(of: DNADiscoveredDevice?.self) { group in
         group.addTask {
             var iterator = stream.makeAsyncIterator()
-            return try? await iterator.next()
+            while let discovery = try? await iterator.next() {
+                if predicate(discovery) {
+                    return discovery
+                }
+            }
+            return nil
         }
         group.addTask {
             try? await Task.sleep(for: timeout)
@@ -177,4 +235,18 @@ private func firstDiscovery(
         group.cancelAll()
         return result
     }
+}
+
+private func waitUntil(
+    _ condition: @escaping @MainActor () -> Bool,
+    attempts: Int = 100,
+    interval: Duration = .milliseconds(10)
+) async -> Bool {
+    for _ in 0..<attempts {
+        if await condition() {
+            return true
+        }
+        try? await Task.sleep(for: interval)
+    }
+    return false
 }

@@ -1,6 +1,15 @@
 import CoreBluetooth
 import Foundation
 
+private struct SimulatedDeviceProfile {
+    let id: UUID
+    let name: String
+    let modelNumber: String
+    let serialNumber: String
+    let rssiOffset: Int
+    let isFlaky: Bool
+}
+
 @MainActor
 @Observable
 public class SimulatedDNASensorManager: NSObject {
@@ -78,10 +87,15 @@ public class SimulatedDNASensorManager: NSObject {
     private var simulationStartTime: Date?
     private var simulationTask: Task<Void, Never>?
     private var connectionTask: Task<Void, Never>?
-    private let simulatedDeviceID = UUID()
+    private var flakyDisconnectTask: Task<Void, Never>?
+    private var connectedDeviceID: UUID?
+    private let stableDeviceID = UUID()
+    private let flakyDeviceID = UUID()
     private let scanInitialDelay: Duration
     private let scanUpdateInterval: Duration
     private let scanRSSIValues: [Int]
+    private let includeFlakyDevice: Bool
+    private let flakyDisconnectInterval: Duration
 
     // MARK: - Initialization
 
@@ -89,17 +103,23 @@ public class SimulatedDNASensorManager: NSObject {
         self.scanInitialDelay = .milliseconds(500)
         self.scanUpdateInterval = .milliseconds(750)
         self.scanRSSIValues = [-50, -65, -75, -85]
+        self.includeFlakyDevice = true
+        self.flakyDisconnectInterval = .seconds(5)
         super.init()
     }
 
     init(
         scanInitialDelay: Duration = .milliseconds(500),
         scanUpdateInterval: Duration = .milliseconds(750),
-        scanRSSIValues: [Int] = [-50, -65, -75, -85]
+        scanRSSIValues: [Int] = [-50, -65, -75, -85],
+        includeFlakyDevice: Bool = true,
+        flakyDisconnectInterval: Duration = .seconds(5)
     ) {
         self.scanInitialDelay = scanInitialDelay
         self.scanUpdateInterval = scanUpdateInterval
         self.scanRSSIValues = scanRSSIValues.isEmpty ? [-50] : scanRSSIValues
+        self.includeFlakyDevice = includeFlakyDevice
+        self.flakyDisconnectInterval = flakyDisconnectInterval
         super.init()
     }
 
@@ -158,8 +178,11 @@ public class SimulatedDNASensorManager: NSObject {
     public func disconnect() {
         connectionTask?.cancel()
         connectionTask = nil
+        flakyDisconnectTask?.cancel()
+        flakyDisconnectTask = nil
         simulationTask?.cancel()
         simulationTask = nil
+        connectedDeviceID = nil
         isConnecting = false
         isConnected = false
         latestReading = nil
@@ -186,22 +209,29 @@ public class SimulatedDNASensorManager: NSObject {
             }
 
             guard let self, !Task.isCancelled else { return }
+            guard let profile = self.simulatedDevices.first(where: { $0.id == deviceID }) else {
+                self.connectionTask = nil
+                self.isConnecting = false
+                return
+            }
 
             self.connectionTask = nil
             self.isConnecting = false
             self.isConnected = true
+            self.connectedDeviceID = deviceID
 
             // Set mock device info
             self.deviceInfo = DNADeviceInfo(
                 manufacturerName: "DiveHub",
-                modelNumber: "DNA Simulator",
-                serialNumber: "SIM-DNA-001",
+                modelNumber: profile.modelNumber,
+                serialNumber: profile.serialNumber,
                 hardwareRevision: "1.0",
                 firmwareRevision: "1.0-SIM"
             )
             self.batteryLevel = 50
 
             self.startSimulation()
+            self.scheduleFlakyDisconnectIfNeeded(for: profile)
         }
     }
 
@@ -229,13 +259,15 @@ public class SimulatedDNASensorManager: NSObject {
                 guard self.activeScanID == scanID, self.isScanning else { return }
 
                 let rssi = self.scanRSSIValues[rssiIndex % self.scanRSSIValues.count]
-                let mockDevice = DNAScanPolicy.recordDiscovery(
-                    id: self.simulatedDeviceID,
-                    name: "Simulated DNA Sensor",
-                    rssi: rssi,
-                    in: &self.discoveredDevices
-                )
-                self.scanContinuation?.yield(mockDevice)
+                for profile in self.simulatedDevices {
+                    let mockDevice = DNAScanPolicy.recordDiscovery(
+                        id: profile.id,
+                        name: profile.name,
+                        rssi: rssi + profile.rssiOffset,
+                        in: &self.discoveredDevices
+                    )
+                    self.scanContinuation?.yield(mockDevice)
+                }
                 rssiIndex += 1
             }
         }
@@ -271,6 +303,54 @@ public class SimulatedDNASensorManager: NSObject {
 
                 try? await Task.sleep(for: .milliseconds(250))
             }
+        }
+    }
+
+    private var simulatedDevices: [SimulatedDeviceProfile] {
+        var devices = [
+            SimulatedDeviceProfile(
+                id: stableDeviceID,
+                name: "Simulated DNA Sensor",
+                modelNumber: "DNA Simulator",
+                serialNumber: "SIM-DNA-001",
+                rssiOffset: 0,
+                isFlaky: false
+            )
+        ]
+
+        if includeFlakyDevice {
+            devices.append(
+                SimulatedDeviceProfile(
+                    id: flakyDeviceID,
+                    name: "Flaky Simulated DNA Sensor",
+                    modelNumber: "DNA Flaky Simulator",
+                    serialNumber: "SIM-DNA-FLAKY",
+                    rssiOffset: -8,
+                    isFlaky: true
+                )
+            )
+        }
+
+        return devices
+    }
+
+    private func scheduleFlakyDisconnectIfNeeded(for profile: SimulatedDeviceProfile) {
+        flakyDisconnectTask?.cancel()
+        flakyDisconnectTask = nil
+
+        guard profile.isFlaky else { return }
+
+        let deviceID = profile.id
+        let disconnectInterval = flakyDisconnectInterval
+        flakyDisconnectTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: disconnectInterval)
+            } catch {
+                return
+            }
+
+            guard let self, self.connectedDeviceID == deviceID, self.isConnected else { return }
+            self.disconnect()
         }
     }
 
