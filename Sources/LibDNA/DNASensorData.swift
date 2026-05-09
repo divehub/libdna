@@ -47,7 +47,7 @@ public struct DNASensorReading: Sendable {
 }
 
 /// Represents the device information.
-public struct DNADeviceInfo: Sendable {
+public struct DNADeviceInfo: Sendable, Equatable {
     public var manufacturerName: String?
     public var modelNumber: String?
     public var serialNumber: String?
@@ -69,8 +69,8 @@ public struct DNADeviceInfo: Sendable {
     }
 }
 
-/// Represents a discovered DNA device.
-public struct DNADiscoveredDevice: Sendable, Identifiable, Hashable {
+/// Represents a simulated DNA device yielded by `DNASensorSimulator`.
+public struct DNASimulatedDevice: Sendable, Identifiable, Hashable {
     public let id: UUID
     public let name: String
     public let rssi: Int

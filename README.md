@@ -1,16 +1,16 @@
 # LibDNA
 
-**LibDNA** is a Swift library for communicating with the **Divesoft DNA** oxygen sensor via Bluetooth Low Energy (BLE). It provides a structured, type-safe API for scanning, connecting, and reading oxygen sensor data, including support for calibration and device metadata.
+**LibDNA** is a Swift library for communicating with the **Divesoft DNA** oxygen sensor via Bluetooth Low Energy (BLE). It provides a structured, type-safe API for running the DNA sensor protocol on an already-connected `CBPeripheral`, including oxygen readings and device metadata.
 
 ## Features
 
-- **Manual Connection Control**: Scan, discover, and choose which device to connect to.
+- **Session-Level DNA Protocol**: Attach to a connected `CBPeripheral` and discover DNA services and characteristics.
 - **Real-time Oxygen Readings**: Stream raw voltage, filtered voltage, and ambient pressure.
 - **Async/Await Support**: Modern Swift concurrency support with `AsyncStream`.
 - **Observation Support**: `@Observable` state for SwiftUI-friendly updates.
-- **Device Metadata**: Reads manufacturer, model, serial number, firmware version, and battery level.
+- **Device Metadata**: Reads manufacturer, model, serial number, firmware version, and battery level once after connection.
 - **Strict Concurrency**: Fully compliant with Swift 6 strict concurrency checks (`Sendable`, `@MainActor`).
-- **Included CLI**: A command-line tool `DNAClient` for testing and demonstration.
+- **Included CLI**: A command-line tool `DNAClient` with a tiny scanner that demonstrates how to wire scanning, connection, and the DNA session together.
 
 ## Requirements
 
@@ -35,30 +35,20 @@ dependencies: [
 ### Basic Setup
 
 ```swift
+import CoreBluetooth
 import LibDNA
 
 @MainActor
 class OxygenMonitor {
-    private let manager = DNASensorManager()
-    private var scanTask: Task<Void, Never>?
+    private let session = DNASensorSession()
 
-    func start() {
-        // 1. Start scanning and connect to the first device found
-        scanTask = Task {
-            do {
-                for try await device in manager.scan(timeout: .seconds(10)) {
-                    print("Found \(device.name), connecting...")
-                    manager.connect(to: device.id)
-                    break
-                }
-            } catch {
-                print("Scan failed: \(error)")
-            }
-        }
+    func didConnectDNADevice(_ peripheral: CBPeripheral) {
+        // The app owns CBCentralManager scanning and link connection.
+        // LibDNA owns the DNA protocol once the peripheral is connected.
+        session.attach(to: peripheral)
 
-        // 2. Listen for readings using AsyncStream
         Task {
-            for await reading in manager.readings {
+            for await reading in session.readings {
                 print("O2: \(reading.filteredVoltage) mV, Pressure: \(reading.ambientPressure) hPa")
             }
         }
@@ -91,10 +81,12 @@ swift run DNAClient
 
 ## Architecture
 
-- **`DNASensorManager`**: The core controller managing `CBCentralManager` and `CBPeripheral`.
+- **`DNASensorSession`**: The DNA protocol session for an already-connected `CBPeripheral`.
 - **`DNASensorReading`**: Immutable struct representing a single data packet.
-- **`DNADeviceInfo`**: Metadata about the connected hardare.
-- **`DNAUUIDs`**: Centralized storage for BLE UUIDs.
+- **`DNADeviceStatus` / `DNADeviceInfo`**: Cached metadata and battery status read after attach.
+- **`DNASensorEvent`**: Attachment and device-status updates for app bridges.
+- **`DNASensorAdvertisement`**: Public service UUIDs for app-owned scanning.
+- **`DNASensorSimulator`**: Demo/test simulator for scanner-style flows.
 
 ## License
 

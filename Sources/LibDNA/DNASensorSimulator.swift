@@ -12,10 +12,10 @@ private struct SimulatedDeviceProfile {
 
 @MainActor
 @Observable
-public class SimulatedDNASensorManager: NSObject {
-    // MARK: - Published Properties (matches DNASensorManager API)
+public final class DNASensorSimulator {
+    // MARK: - Published Properties
 
-    /// The current connection state of the sensor.
+    /// The current simulated link/session state.
     public private(set) var isConnected: Bool = false
 
     /// The current scanning state.
@@ -27,14 +27,11 @@ public class SimulatedDNASensorManager: NSObject {
     /// The latest reading received from the sensor.
     public private(set) var latestReading: DNASensorReading?
 
-    /// The device information.
-    public private(set) var deviceInfo: DNADeviceInfo = DNADeviceInfo()
-
-    /// The battery level (0-100).
-    public private(set) var batteryLevel: Int?
+    /// Latest simulated device status.
+    public private(set) var deviceStatus = DNADeviceStatus.empty
 
     /// The list of discovered devices.
-    public private(set) var discoveredDevices: [DNADiscoveredDevice] = []
+    public private(set) var discoveredDevices: [DNASimulatedDevice] = []
 
     /// The current Bluetooth state (always poweredOn for simulation).
     public private(set) var bluetoothState: CBManagerState = .poweredOn
@@ -60,7 +57,7 @@ public class SimulatedDNASensorManager: NSObject {
     // Internal continuations for the async stream
     private var readingContinuations: [UUID: AsyncStream<DNASensorReading>.Continuation] = [:]
     private var bluetoothStateContinuations: [UUID: AsyncStream<CBManagerState>.Continuation] = [:]
-    private var scanContinuation: AsyncThrowingStream<DNADiscoveredDevice, Error>.Continuation?
+    private var scanContinuation: AsyncThrowingStream<DNASimulatedDevice, Error>.Continuation?
     private var scanTimeoutTask: Task<Void, Never>?
     private var scanTask: Task<Void, Never>?
     private var activeScanID: UUID?
@@ -82,6 +79,22 @@ public class SimulatedDNASensorManager: NSObject {
         return stream
     }
 
+    /// Async stream of simulated attachment and device status updates.
+    public var events: AsyncStream<DNASensorEvent> {
+        let (stream, continuation) = AsyncStream<DNASensorEvent>.makeStream()
+
+        let id = UUID()
+        eventContinuations[id] = continuation
+
+        continuation.onTermination = { [weak self] _ in
+            Task { @MainActor in
+                self?.eventContinuations.removeValue(forKey: id)
+            }
+        }
+
+        return stream
+    }
+
     // MARK: - Simulation Properties
 
     private var simulationStartTime: Date?
@@ -89,6 +102,7 @@ public class SimulatedDNASensorManager: NSObject {
     private var connectionTask: Task<Void, Never>?
     private var flakyDisconnectTask: Task<Void, Never>?
     private var connectedDeviceID: UUID?
+    private var eventContinuations: [UUID: AsyncStream<DNASensorEvent>.Continuation] = [:]
     private let stableDeviceID = UUID()
     private let flakyDeviceID = UUID()
     private let scanInitialDelay: Duration
@@ -99,13 +113,12 @@ public class SimulatedDNASensorManager: NSObject {
 
     // MARK: - Initialization
 
-    public override init() {
+    public init() {
         self.scanInitialDelay = .milliseconds(500)
         self.scanUpdateInterval = .milliseconds(750)
         self.scanRSSIValues = [-50, -65, -75, -85]
         self.includeFlakyDevice = true
         self.flakyDisconnectInterval = .seconds(5)
-        super.init()
     }
 
     init(
@@ -120,14 +133,13 @@ public class SimulatedDNASensorManager: NSObject {
         self.scanRSSIValues = scanRSSIValues.isEmpty ? [-50] : scanRSSIValues
         self.includeFlakyDevice = includeFlakyDevice
         self.flakyDisconnectInterval = flakyDisconnectInterval
-        super.init()
     }
 
     // MARK: - Public API
 
     /// Scans for DNA sensors and yields discoveries as they arrive.
     public func scan(timeout: Duration = .seconds(10))
-        -> AsyncThrowingStream<DNADiscoveredDevice, Error>
+        -> AsyncThrowingStream<DNASimulatedDevice, Error>
     {
         AsyncThrowingStream { continuation in
             stopScan()
@@ -170,7 +182,7 @@ public class SimulatedDNASensorManager: NSObject {
     public func stopScan() {
         scanTask?.cancel()
         scanTask = nil
-        isScanning = false
+        setScanning(false)
         finishScan()
     }
 
@@ -183,9 +195,9 @@ public class SimulatedDNASensorManager: NSObject {
         simulationTask?.cancel()
         simulationTask = nil
         connectedDeviceID = nil
-        isConnecting = false
-        isConnected = false
+        setConnectionState(isConnected: false, isConnecting: false)
         latestReading = nil
+        clearCachedMetadata()
     }
 
     /// Connects to a specific discovered device.
@@ -198,7 +210,7 @@ public class SimulatedDNASensorManager: NSObject {
         stopScan()
         connectionTask?.cancel()
         connectionTask = nil
-        isConnecting = true
+        setConnectionState(isConnected: false, isConnecting: true)
 
         connectionTask = Task { @MainActor [weak self] in
             // Simulate connection delay
@@ -211,24 +223,24 @@ public class SimulatedDNASensorManager: NSObject {
             guard let self, !Task.isCancelled else { return }
             guard let profile = self.simulatedDevices.first(where: { $0.id == deviceID }) else {
                 self.connectionTask = nil
-                self.isConnecting = false
+                self.setConnectionState(isConnected: false, isConnecting: false)
                 return
             }
 
             self.connectionTask = nil
-            self.isConnecting = false
-            self.isConnected = true
+            self.setConnectionState(isConnected: true, isConnecting: false)
             self.connectedDeviceID = deviceID
 
-            // Set mock device info
-            self.deviceInfo = DNADeviceInfo(
-                manufacturerName: "DiveHub",
-                modelNumber: profile.modelNumber,
-                serialNumber: profile.serialNumber,
-                hardwareRevision: "1.0",
-                firmwareRevision: "1.0-SIM"
-            )
-            self.batteryLevel = 50
+            self.setDeviceStatus(DNADeviceStatus(
+                deviceInfo: DNADeviceInfo(
+                    manufacturerName: "DiveHub",
+                    modelNumber: profile.modelNumber,
+                    serialNumber: profile.serialNumber,
+                    hardwareRevision: "1.0",
+                    firmwareRevision: "1.0-SIM"
+                ),
+                batteryLevel: 50
+            ))
 
             self.startSimulation()
             self.scheduleFlakyDisconnectIfNeeded(for: profile)
@@ -240,7 +252,7 @@ public class SimulatedDNASensorManager: NSObject {
     private func startScanningInternal(scanID: UUID) {
         guard !isScanning else { return }
 
-        isScanning = true
+        setScanning(true)
         discoveredDevices.removeAll()
 
         scanTask?.cancel()
@@ -371,4 +383,39 @@ public class SimulatedDNASensorManager: NSObject {
     }
 }
 
-extension SimulatedDNASensorManager: BluetoothScanningManaging {}
+private extension DNASensorSimulator {
+    func setScanning(_ newValue: Bool) {
+        guard isScanning != newValue else { return }
+        isScanning = newValue
+    }
+
+    func setConnectionState(isConnected newIsConnected: Bool, isConnecting newIsConnecting: Bool) {
+        let connectionChanged = isConnected != newIsConnected
+        guard connectionChanged || isConnecting != newIsConnecting else { return }
+        isConnected = newIsConnected
+        isConnecting = newIsConnecting
+        if connectionChanged {
+            emitEvent(.attachmentChanged(isAttached: newIsConnected))
+        }
+    }
+
+    func setDeviceStatus(_ newValue: DNADeviceStatus) {
+        guard deviceStatus != newValue else { return }
+        deviceStatus = newValue
+        emitDeviceStatus()
+    }
+
+    func clearCachedMetadata() {
+        setDeviceStatus(.empty)
+    }
+
+    func emitDeviceStatus() {
+        emitEvent(.deviceStatusChanged(deviceStatus))
+    }
+
+    func emitEvent(_ event: DNASensorEvent) {
+        for continuation in eventContinuations.values {
+            continuation.yield(event)
+        }
+    }
+}
